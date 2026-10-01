@@ -1,0 +1,106 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+      # Detect target framework from .csproj
+      - TARGET_FW=$(grep -oP '(?<=<TargetFramework>)[^<]+' OrchardLiteApp/OrchardLite.Web/OrchardLite.Web.csproj)
+      - echo "Detected target framework - $TARGET_FW"
+
+      # Set SDK/runtime image tags based on framework (generic: works for any
+      # netX.Y target, e.g. net3.1, net8.0, net10.0, future versions, etc.)
+      - |
+        VERSION=$(echo "$TARGET_FW" | grep -oP '(?<=^net)[0-9]+\.[0-9]+')
+        if [ -n "$VERSION" ]; then
+          export SDK_TAG="$VERSION"
+          export RUNTIME_TAG="$VERSION"
+          echo "Building as .NET $VERSION"
+        else
+          export SDK_TAG="3.1"
+          export RUNTIME_TAG="3.1"
+          echo "Could not parse target framework '$TARGET_FW' - defaulting to .NET Core 3.1 (legacy)"
+        fi
+
+      # Auto-fix common Transform issues (CS0136 duplicate variable declarations)
+      # Applies to any modernized (non-legacy) target, not just net8, so future
+      # .NET versions produced by Transform are covered too.
+      - |
+        if [ "$SDK_TAG" != "3.1" ]; then
+          echo "Checking for common Transform compilation issues..."
+          CONTROLLER="OrchardLiteApp/OrchardLite.Web/Controllers/HomeController.cs"
+          if [ -f "$CONTROLLER" ]; then
+            COUNT=$(grep -c 'var dbHost' "$CONTROLLER" || true)
+            if [ "$COUNT" -gt "1" ]; then
+              echo "Detected duplicate 'var dbHost' declarations ($COUNT found) - applying auto-fix..."
+              awk '/var dbHost/{n++; if(n>1) sub(/var dbHost/, "var dbHostCheck")}1' "$CONTROLLER" > /tmp/controller_fixed.cs
+              mv /tmp/controller_fixed.cs "$CONTROLLER"
+              echo "Auto-fix applied"
+            fi
+          fi
+        fi
+
+      # Ensure Error.cshtml exists (Transform may reference it)
+      - |
+        mkdir -p OrchardLiteApp/OrchardLite.Web/Views/Shared
+        if [ ! -f "OrchardLiteApp/OrchardLite.Web/Views/Shared/Error.cshtml" ]; then
+          cat > OrchardLiteApp/OrchardLite.Web/Views/Shared/Error.cshtml << 'ERROREOF'
+        @{
+            ViewData["Title"] = "Error";
+        }
+        <div style="padding: 20px; font-family: Arial, sans-serif;">
+            <h1 style="color: #d9534f;">Error</h1>
+            <h2>An error occurred while processing your request.</h2>
+            @if (!string.IsNullOrEmpty(ViewBag.Error?.ToString()))
+            {
+                <p><strong>Details:</strong> @ViewBag.Error</p>
+            }
+            <hr />
+            <p><a href="/">Return to Home</a></p>
+        </div>
+        ERROREOF
+          echo "Error.cshtml created"
+        fi
+
+      # Generate a Dockerfile that matches the detected framework
+      - |
+        cat > OrchardLiteApp/Dockerfile.generated << EOF
+        FROM mcr.microsoft.com/dotnet/sdk:${SDK_TAG} AS build
+        WORKDIR /app
+        COPY OrchardLite.sln ./
+        COPY OrchardLite.Web/OrchardLite.Web.csproj ./OrchardLite.Web/
+        RUN dotnet restore
+        COPY . ./
+        RUN dotnet publish OrchardLite.Web/OrchardLite.Web.csproj -c Release -o /app/publish
+
+        FROM mcr.microsoft.com/dotnet/aspnet:${RUNTIME_TAG}
+        WORKDIR /app
+        COPY --from=build /app/publish ./
+        EXPOSE 80
+        ENV ASPNETCORE_URLS=http://+:80
+        ENTRYPOINT ["dotnet", "OrchardLite.Web.dll"]
+        EOF
+
+  build:
+    commands:
+      - echo Build started on `date`
+      - cd OrchardLiteApp
+      - docker build -f Dockerfile.generated -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - cd ..
+      - printf '[{"name":"orchardlite-app","imageUri":"%s"}]' $REPOSITORY_URI:latest > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
